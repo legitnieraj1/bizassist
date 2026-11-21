@@ -99,8 +99,21 @@ export async function POST(request: Request) {
       created_at: now
     });
 
-    // AI Knowledge-based retrieval & answer
-    const botResult = await queryKnowledgeBaseChatbot(message);
+    // Fetch recent conversation history for conversational grounding
+    const { data: historyRows } = await db
+      .from("chat_messages")
+      .select("sender_type, message")
+      .eq("session_id", sessionId)
+      .order("created_at", { ascending: true })
+      .limit(6);
+
+    const history = ((historyRows || []) as any[]).map((r: any) => ({
+      role: r.sender_type === "customer" ? ("user" as const) : ("bot" as const),
+      text: r.message
+    }));
+
+    // AI Knowledge-based retrieval & answer powered by Gemini
+    const botResult = await queryKnowledgeBaseChatbot(message, history);
 
     // Save bot reply
     const botMsgId = "cmsg-" + Math.random().toString(36).substring(2, 9);

@@ -26,7 +26,7 @@ export default function ChatWidget({ embedded = false }: { embedded?: boolean })
     {
       id: "intro-1",
       sender: "ai_bot",
-      text: "BIZASSIST AI CORE ONLINE.\n\nI am your automated knowledge-retrieval assistant grounded in verified company documentation. Ask any technical, billing, or account question. If verified documentation does not contain an answer, I will prompt escalation to human support engineers.",
+      text: "Hello! I am BizAssist AI, your intelligent customer support assistant.\n\nI can assist you with your account, billing, API integrations, ticket tracking, and platform documentation. How can I help you today?",
     }
   ]);
   const [input, setInput] = useState("");
