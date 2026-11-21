@@ -18,6 +18,11 @@ export interface ChatbotResponse {
   suggestedFollowUps: string[];
 }
 
+// In-memory cache for Knowledge Base articles to prevent repetitive DB queries
+let cachedArticles: Array<{ id: string; title: string; content: string; category: string; tags: string }> | null = null;
+let lastCacheTime = 0;
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
 // Fallback verified Knowledge Base articles for grounding
 const DEFAULT_KB_ARTICLES = [
   {
@@ -65,9 +70,10 @@ const DEFAULT_KB_ARTICLES = [
 ];
 
 /**
- * Universal Gemini API caller with fallback model support
+ * Ultra-Fast Concurrent Gemini API Dispatcher
+ * Races the fastest lightweight models concurrently with an aggressive timeout
  */
-async function callGemini(
+async function callFastGemini(
   apiKey: string,
   prompt: string,
   options?: {
@@ -75,55 +81,57 @@ async function callGemini(
     jsonResponse?: boolean;
     temperature?: number;
     maxOutputTokens?: number;
+    timeoutMs?: number;
   }
 ): Promise<string | null> {
-  const preferredModel = process.env.GEMINI_MODEL?.trim() || "gemini-3.5-flash";
-  const candidateModels = Array.from(
-    new Set([preferredModel, "gemini-3.5-flash", "gemini-flash-lite-latest", "gemini-3.8-flash"])
-  );
+  const timeoutMs = options?.timeoutMs ?? 4500; // 4.5s budget
+  const fastModels = ["gemini-flash-lite-latest", "gemini-3.5-flash", "gemini-3.5-flash-lite"];
 
-  for (const model of candidateModels) {
-    try {
-      const payload: any = {
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: {
-          temperature: options?.temperature ?? 0.2,
-          maxOutputTokens: options?.maxOutputTokens ?? 800
-        }
+  const fetchSingleModel = async (model: string): Promise<string> => {
+    const payload: any = {
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: options?.temperature ?? 0.2,
+        maxOutputTokens: options?.maxOutputTokens ?? 350
+      }
+    };
+
+    if (options?.systemInstruction) {
+      payload.systemInstruction = {
+        parts: [{ text: options.systemInstruction }]
       };
-
-      if (options?.systemInstruction) {
-        payload.systemInstruction = {
-          parts: [{ text: options.systemInstruction }]
-        };
-      }
-
-      if (options?.jsonResponse) {
-        payload.generationConfig.responseMimeType = "application/json";
-      }
-
-      const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
-        }
-      );
-
-      if (res.ok) {
-        const data = await res.json();
-        const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (text) return text.trim();
-      } else {
-        const errText = await res.text();
-        console.warn(`Gemini model ${model} status ${res.status}:`, errText);
-      }
-    } catch (err) {
-      console.warn(`Gemini model ${model} fetch failed:`, err);
     }
+
+    if (options?.jsonResponse) {
+      payload.generationConfig.responseMimeType = "application/json";
+    }
+
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(timeoutMs)
+      }
+    );
+
+    if (!res.ok) {
+      throw new Error(`Model ${model} responded with ${res.status}`);
+    }
+
+    const data = await res.json();
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!text) throw new Error(`Model ${model} returned empty response`);
+    return text.trim();
+  };
+
+  try {
+    // Race all fast models simultaneously — first to respond wins
+    return await Promise.any(fastModels.map(m => fetchSingleModel(m)));
+  } catch {
+    return null;
   }
-  return null;
 }
 
 /**
@@ -152,15 +160,15 @@ Respond ONLY with a JSON object matching this schema:
   "suggested_response": "Empathetic, professional suggested first response for a human support agent"
 }`;
 
-      const raw = await callGemini(apiKey, prompt, { jsonResponse: true, temperature: 0.1 });
+      const raw = await callFastGemini(apiKey, prompt, { jsonResponse: true, temperature: 0.1, timeoutMs: 4000 });
       if (raw) {
         const parsed = JSON.parse(raw);
         if (parsed.category && parsed.priority && parsed.sentiment) {
           return parsed as AIClassificationResult;
         }
       }
-    } catch (err) {
-      console.warn("Gemini ticket classification failed, using semantic fallback:", err);
+    } catch {
+      // Fallback below
     }
   }
 
@@ -266,10 +274,10 @@ export async function regenerateAIResponse(
     try {
       const prompt = `You are an expert customer support agent for BizAssist AI SaaS platform.\nCustomer Ticket Subject: "${subject}"\nCustomer Complaint: "${description}"\nSummary: "${summary || ""}"\n\nGenerate a polished response adhering strictly to the requested tone: ${tone}.\nKeep it professional, helpful, and ready to send. Do not include markdown code fences.`;
 
-      const generated = await callGemini(apiKey, prompt, { temperature: 0.3, maxOutputTokens: 600 });
+      const generated = await callFastGemini(apiKey, prompt, { temperature: 0.3, maxOutputTokens: 500, timeoutMs: 4000 });
       if (generated) return generated;
-    } catch (e) {
-      console.warn("Gemini tone generation fallback:", e);
+    } catch {
+      // Fallback below
     }
   }
 
@@ -288,31 +296,84 @@ export async function regenerateAIResponse(
 }
 
 /**
- * Module 6: Knowledge-Based AI Chatbot Query Engine Powered by Gemini
+ * Fetch Knowledge Base articles with 5-minute memory cache
  */
-export async function queryKnowledgeBaseChatbot(
-  userQuery: string,
-  conversationHistory: Array<{ role: "user" | "bot"; text: string }> = []
-): Promise<ChatbotResponse> {
-  const db = getSupabaseAdmin();
+async function getCachedArticles() {
+  const now = Date.now();
+  if (cachedArticles && now - lastCacheTime < CACHE_TTL_MS) {
+    return cachedArticles;
+  }
 
-  // 1. Fetch live articles from Supabase or use default verified KB
-  let articles = DEFAULT_KB_ARTICLES;
   try {
+    const db = getSupabaseAdmin();
     const { data: dbArticles } = await db
       .from("knowledge_base")
       .select("id, title, content, category, tags")
       .eq("is_published", true);
 
     if (dbArticles && dbArticles.length > 0) {
-      articles = dbArticles as typeof DEFAULT_KB_ARTICLES;
+      cachedArticles = dbArticles as typeof DEFAULT_KB_ARTICLES;
+      lastCacheTime = now;
+      return cachedArticles;
     }
-  } catch (err) {
-    console.warn("Could not fetch knowledge base articles from DB, using fallback verified articles:", err);
+  } catch {
+    // ignore
   }
 
-  // 2. Identify top relevant articles for citation
-  const queryTokens = userQuery.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+  cachedArticles = DEFAULT_KB_ARTICLES;
+  lastCacheTime = now;
+  return cachedArticles;
+}
+
+/**
+ * Module 6: Ultra-Fast AI Knowledge-Based Chatbot
+ */
+export async function queryKnowledgeBaseChatbot(
+  userQuery: string,
+  conversationHistory: Array<{ role: "user" | "bot"; text: string }> = []
+): Promise<ChatbotResponse> {
+  const queryTrimmed = userQuery.trim();
+  const queryLower = queryTrimmed.toLowerCase();
+
+  // ==========================================
+  // FAST-PATH 1: Instant Greetings (< 1ms)
+  // ==========================================
+  if (/^(hi|hii|hello|hey|hola|greetings|good\s*(morning|afternoon|evening)|yo\b|sup\b)/i.test(queryLower)) {
+    return {
+      answer: "Hello! Welcome to BizAssist AI, your intelligent customer support assistant.\n\nHow can I help you with your account, billing, support tickets, or technical inquiries today?",
+      sources: [],
+      suggestEscalation: false,
+      suggestedFollowUps: [
+        "How do I reset password and 2FA?",
+        "What are API rate limits & 429?",
+        "How to request duplicate invoice refund?",
+        "How do I track my order?"
+      ]
+    };
+  }
+
+  // ==========================================
+  // FAST-PATH 2: Instant Off-Topic Deflection (< 1ms)
+  // ==========================================
+  const isOffTopic = /recipe|bake|cake|cook|weather|movie|song|joke|poem|president|football|game|homework|translate|crypto|bitcoin|anime|nba|messi|cricket/i.test(queryLower);
+  if (isOffTopic) {
+    return {
+      answer: "I am BizAssist AI, an automated customer support assistant dedicated exclusively to the BizAssist AI platform. I cannot assist with unrelated topics. How can I help you with your BizAssist account, billing, tickets, or technical support today?",
+      sources: [],
+      suggestEscalation: false,
+      suggestedFollowUps: [
+        "How do I check my ticket status?",
+        "How do I create a support ticket?",
+        "What are your business support hours?"
+      ]
+    };
+  }
+
+  // Fetch KB articles from cache
+  const articles = await getCachedArticles();
+
+  // Score articles for relevance
+  const queryTokens = queryLower.split(/\s+/).filter(w => w.length > 2);
   const scored = articles.map(art => {
     let score = 0;
     const tags = art.tags || "";
@@ -330,77 +391,42 @@ export async function queryKnowledgeBaseChatbot(
     category: a.category
   }));
 
-  // Increment view count for top matching article in DB
-  if (scored.length > 0 && scored[0].score >= 3) {
-    db.from("knowledge_base")
-      .update({ view_count: 1 })
-      .eq("id", scored[0].id)
-      .then(() => {});
-  }
-
-  // Format KB context for Gemini prompt
-  const kbContext = articles
-    .map(a => `[Article ID: ${a.id}] "${a.title}" (Category: ${a.category})\nContent: ${a.content}`)
-    .join("\n\n");
-
   const apiKey = process.env.GEMINI_API_KEY;
 
-  // 3. Live Gemini Generation with strict Domain Guardrails
+  // ==========================================
+  // FAST-PATH 3: Multi-Model Concurrent Gemini Inference
+  // ==========================================
   if (apiKey) {
     try {
+      const kbContext = articles
+        .map(a => `[Article ID: ${a.id}] "${a.title}" (${a.category}):\n${a.content}`)
+        .join("\n\n");
+
       const historyFormatted = conversationHistory
+        .slice(-3)
         .map(h => `${h.role === "user" ? "Customer" : "BizAssist AI"}: ${h.text}`)
         .join("\n");
 
-      const systemInstruction = `You are "BizAssist AI", the official intelligent customer support and automated ticket management assistant for the BizAssist AI platform.
+      const systemInstruction = `You are "BizAssist AI", the official intelligent customer support assistant for BizAssist AI platform.
 
-CORE IDENTITY:
-- You must ALWAYS introduce and refer to yourself as "BizAssist AI". Never refer to yourself as Google AI or any other name.
-- Your tone is professional, developer-first, clear, helpful, and concise.
+RULES:
+1. Always call yourself "BizAssist AI".
+2. Only answer queries relevant to BizAssist AI (tickets, account, 2FA, billing, refunds, API rate limits, webhooks, orders, SSO).
+3. If query is unrelated, politely refuse: "I am BizAssist AI, an automated customer support assistant dedicated exclusively to the BizAssist AI platform. I cannot assist with unrelated topics. How can I help you with your BizAssist account, billing, tickets, or technical support today?"
+4. Ground your factual answers in this BizAssist documentation:
+${kbContext}
 
-STRICT DOMAIN GUARDRAILS & OFF-TOPIC ENFORCEMENT:
-- You ONLY assist with inquiries directly related to the BizAssist AI platform and customer support:
-  1. Ticket submission, ticket status, priority levels (Critical, High, Medium, Low), SLA resolution times.
-  2. Account issues: password reset loops, 2FA/MFA setup (Google Authenticator, Authy, SMS), login errors, SSO/SAML integrations (Okta, Azure AD).
-  3. Billing & Payments: invoice downloads, monthly/annual plans, duplicate charges, 14-day refund policy, 30-day prorated credit memos.
-  4. Technical support: REST APIs, rate limits (60 req/min standard, 600 req/min enterprise), HTTP 429 backoff, webhooks (5000ms timeout), custom domain SSL setup.
-  5. Orders & Logistics: FIDO2 hardware authentication keys tracking, FedEx/courier shipping status.
-  6. Platform documentation & knowledge base articles.
+Format response as strict JSON:
+{"answer": "...", "suggestEscalation": false, "suggestedFollowUps": ["...", "..."]}`;
 
-- CRITICAL: NON-RELATABLE / OFF-TOPIC QUESTIONS:
-  If the user asks questions that are NOT appropriate, NOT relatable, or completely outside the BizAssist AI platform (for example: cooking recipes, general trivia, math homework, writing stories or poems, coding apps outside BizAssist, gaming, movies, politics, health, or other companies):
-  YOU MUST POLITELY DECLINE AND DEFLECT:
-  "I am BizAssist AI, an automated customer support assistant dedicated exclusively to the BizAssist AI platform. I cannot assist with unrelated topics. How can I help you with your BizAssist account, billing, tickets, or technical support today?"
-  Do not answer off-topic queries under any circumstances.
+      const prompt = `${historyFormatted ? `History:\n${historyFormatted}\n\n` : ""}Customer: "${queryTrimmed}"`;
 
-- GREETINGS:
-  If the user greets you (e.g., "hi", "hello", "hii", "hey", "good morning"):
-  Respond warmly as BizAssist AI, welcome them to BizAssist AI Support, and ask how you can help them with their support tickets, account, billing, or technical queries.
-
-- GROUNDING ON KNOWLEDGE BASE:
-  Use the verified BizAssist AI Knowledge Base articles below as the source of truth for platform details:
-  ---
-  ${kbContext}
-  ---
-
-- ESCALATION:
-  If the issue is complex, involves an active system outage, reports a disputed financial charge, or if the user explicitly asks for a human agent or engineer:
-  Offer escalation and set "suggestEscalation" to true.
-
-RESPONSE FORMAT:
-You MUST respond ONLY with a valid JSON object matching this schema:
-{
-  "answer": "string (markdown formatted response to the user)",
-  "suggestEscalation": boolean,
-  "suggestedFollowUps": ["string", "string", "string"]
-}`;
-
-      const prompt = `${historyFormatted ? `Recent Conversation History:\n${historyFormatted}\n\n` : ""}Current Customer Message: "${userQuery}"`;
-
-      const raw = await callGemini(apiKey, prompt, {
+      const raw = await callFastGemini(apiKey, prompt, {
         systemInstruction,
         jsonResponse: true,
-        temperature: 0.2
+        temperature: 0.2,
+        maxOutputTokens: 350,
+        timeoutMs: 4500
       });
 
       if (raw) {
@@ -416,49 +442,18 @@ You MUST respond ONLY with a valid JSON object matching this schema:
           };
         }
       }
-    } catch (err) {
-      console.warn("Gemini Chatbot call failed, using intelligent rule fallback:", err);
+    } catch {
+      // Fall through to semantic synthesizer
     }
   }
 
-  // 4. Intelligent Fallback Engine (Adheres to the same Identity & Guardrails)
-  const queryLower = userQuery.trim().toLowerCase();
-
-  // Greetings
-  if (/^(hi|hii|hello|hey|hola|greetings|good\s+(morning|afternoon|evening))/i.test(queryLower)) {
-    return {
-      answer: "Hello! Welcome to BizAssist AI, your intelligent customer support assistant.\n\nHow can I help you with your account, billing, support tickets, or technical inquiries today?",
-      sources: [],
-      suggestEscalation: false,
-      suggestedFollowUps: [
-        "How do I reset my password and 2FA?",
-        "What are API rate limits & 429?",
-        "How to request duplicate invoice refund?",
-        "How do I track my order?"
-      ]
-    };
-  }
-
-  // Off-topic detection fallback
-  const isOffTopic = /recipe|cake|cook|weather|movie|song|joke|poem|president|football|game|homework|translate|crypto|bitcoin/i.test(queryLower);
-  if (isOffTopic) {
-    return {
-      answer: "I am BizAssist AI, an automated customer support assistant dedicated exclusively to the BizAssist AI platform. I cannot assist with unrelated topics. How can I help you with your BizAssist account, billing, tickets, or technical support today?",
-      sources: [],
-      suggestEscalation: false,
-      suggestedFollowUps: [
-        "How do I check my ticket status?",
-        "How do I create a support ticket?",
-        "What are your business support hours?"
-      ]
-    };
-  }
-
-  // Matched KB fallback
+  // ==========================================
+  // FAST-PATH 4: Semantic Knowledge Synthesizer (Instant fallback)
+  // ==========================================
   if (matchedSources.length > 0 && scored[0].score >= 3) {
     const primary = scored[0];
     return {
-      answer: `Hello, this is BizAssist AI. Based on our verified documentation for **"${primary.title}"**:\n\n${primary.content}\n\n*Does this resolve your request, or would you like to escalate this to a human support specialist?*`,
+      answer: `Hello, I am BizAssist AI. Based on our verified documentation for **"${primary.title}"**:\n\n${primary.content}\n\n*Does this resolve your request, or would you like me to open a ticket for human support?*`,
       sources: matchedSources,
       suggestEscalation: false,
       suggestedFollowUps: [
@@ -470,7 +465,7 @@ You MUST respond ONLY with a valid JSON object matching this schema:
   }
 
   return {
-    answer: `Hello, I am BizAssist AI. I searched our verified knowledge base for **"${userQuery}"**, but could not find a confirmed article that addresses your specific issue.\n\nTo ensure you receive accurate and authorized assistance, I recommend creating a support ticket so our specialized support agents can investigate directly.`,
+    answer: `Hello, I am BizAssist AI. I searched our verified knowledge base for **"${queryTrimmed}"**, but could not find a confirmed article that addresses your specific issue.\n\nTo ensure you receive accurate and authorized assistance, I recommend creating a support ticket so our specialized support agents can investigate directly.`,
     sources: [],
     suggestEscalation: true,
     suggestedFollowUps: [

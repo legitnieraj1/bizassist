@@ -15,13 +15,14 @@ export async function POST(request: Request) {
     // Create session if not provided
     if (!sessionId) {
       sessionId = "chat-" + Math.random().toString(36).substring(2, 9);
-      await db.from("chat_sessions").insert({
+      // Fire-and-forget session creation so it doesn't block response
+      db.from("chat_sessions").insert({
         id: sessionId,
         customer_id: currentUser?.id || null,
         customer_name: currentUser?.full_name || "Guest Customer",
         status: "active",
         created_at: now
-      });
+      }).then(() => {});
     }
 
     // Action: Escalate chat to ticket
@@ -63,19 +64,19 @@ export async function POST(request: Request) {
         updated_at: now
       });
 
-      // Link session to ticket
-      await db.from("chat_sessions")
+      // Link session to ticket & record system message
+      db.from("chat_sessions")
         .update({ status: "escalated", escalated_ticket_id: ticketId })
-        .eq("id", sessionId);
+        .eq("id", sessionId)
+        .then(() => {});
 
-      // System message in chat
-      await db.from("chat_messages").insert({
+      db.from("chat_messages").insert({
         id: "cmsg-" + Math.random().toString(36).substring(2, 9),
         session_id: sessionId,
         sender_type: "system",
         message: `Ticket ${ticketNumber} has been successfully opened for human agent follow-up. You can track this in your Tickets portal.`,
         created_at: now
-      });
+      }).then(() => {});
 
       return NextResponse.json({
         success: true,
@@ -90,42 +91,50 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Message is required" }, { status: 400 });
     }
 
-    // Save customer message
-    await db.from("chat_messages").insert({
+    // 1. Asynchronously log the customer's incoming message without blocking the AI query
+    db.from("chat_messages").insert({
       id: "cmsg-" + Math.random().toString(36).substring(2, 9),
       session_id: sessionId,
       sender_type: "customer",
       message: message.trim(),
       created_at: now
-    });
+    }).then(() => {});
 
-    // Fetch recent conversation history for conversational grounding
-    const { data: historyRows } = await db
-      .from("chat_messages")
-      .select("sender_type, message")
-      .eq("session_id", sessionId)
-      .order("created_at", { ascending: true })
-      .limit(6);
+    // 2. Fetch recent conversation history quickly for context (limited to 4 messages)
+    let history: Array<{ role: "user" | "bot"; text: string }> = [];
+    try {
+      const { data: historyRows } = await db
+        .from("chat_messages")
+        .select("sender_type, message")
+        .eq("session_id", sessionId)
+        .order("created_at", { ascending: false })
+        .limit(4);
 
-    const history = ((historyRows || []) as any[]).map((r: any) => ({
-      role: r.sender_type === "customer" ? ("user" as const) : ("bot" as const),
-      text: r.message
-    }));
+      if (historyRows && historyRows.length > 0) {
+        history = (historyRows as any[]).reverse().map((r: any) => ({
+          role: r.sender_type === "customer" ? ("user" as const) : ("bot" as const),
+          text: r.message
+        }));
+      }
+    } catch {
+      // Continue without history if DB is slow
+    }
 
-    // AI Knowledge-based retrieval & answer powered by Gemini
+    // 3. AI Knowledge-based retrieval & answer powered by fast multi-agent Gemini
     const botResult = await queryKnowledgeBaseChatbot(message, history);
 
-    // Save bot reply
+    // 4. Save bot reply asynchronously in background
     const botMsgId = "cmsg-" + Math.random().toString(36).substring(2, 9);
-    await db.from("chat_messages").insert({
+    db.from("chat_messages").insert({
       id: botMsgId,
       session_id: sessionId,
       sender_type: "ai_bot",
       message: botResult.answer,
       sources_json: JSON.stringify(botResult.sources),
       created_at: new Date().toISOString()
-    });
+    }).then(() => {});
 
+    // 5. Return response immediately!
     return NextResponse.json({
       session_id: sessionId,
       answer: botResult.answer,
